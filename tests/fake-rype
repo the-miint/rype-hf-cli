@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Stand-in for `rype classify filter`, for testing rype-hf's plumbing without a
+# rype index: every read or pair "survives". Output layout matches rype's:
+# paired reads interleaved as <id>/1, <id>/2 on stdout (or --output), or R1 to
+# --output and R2 to --output2; the summary line rype-hf parses goes to stderr.
+# FAKE_FAIL=1 makes it fail before opening any output.
+set -euo pipefail
+[[ ${1:-} == classify && ${2:-} == filter ]] || { echo "fake-rype: classify filter only" >&2; exit 2; }
+[[ ${3:-} == --help ]] && exit 0
+shift 2
+out= out2= r1= r2=
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -1) r1=$2; shift ;; -2) r2=$2; shift ;;
+        --output) out=$2; shift ;; --output2) out2=$2; shift ;;
+    esac
+    shift
+done
+[[ -n ${FAKE_FAIL:-} ]] && { echo "fake-rype: failing on purpose" >&2; exit 3; }
+dc () { case $1 in *.gz) gzip -dc "$1" ;; *) cat "$1" ;; esac; }
+n=$(( $(dc "${r1}" | wc -l) / 4 ))
+if [[ -z ${r2} ]]; then
+    dc "${r1}" | awk 'NR % 4 == 1 { print $1; next } { print }' > "${out:-/dev/stdout}"
+else
+    paste <(dc "${r1}" | paste - - - -) <(dc "${r2}" | paste - - - -) \
+        | awk -F'\t' -v o1="${out:-/dev/stdout}" -v o2="${out2}" '{
+              print $1 "/1\n" $2 "\n+\n" $4 > o1
+              print $5 "/2\n" $6 "\n+\n" $8 > (o2 == "" ? o1 : o2)
+          }'
+fi
+echo "rype classify filter: reads_in=${n} matched=0 written=${n} passes=1 threshold=0.1" >&2

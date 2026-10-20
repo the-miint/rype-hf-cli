@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# rype-hf: streaming host filtration with rype, optionally followed by a
+# minimap2 rescue pass. Reads flow through one pipe; nothing intermediate is
+# written to disk.
+#
+#   rype classify filter  ->  [minimap2 -a | samtools fastq (unmapped only)]  ->  output
+#
+# rype writes only the reads/pairs that do NOT reach the threshold in any
+# bucket of the host index. With -m, those survivors are aligned to a host
+# minimap2 index and only reads that stay unmapped are kept -- for pairs, both
+# mates must be unmapped (samtools fastq -f 12), so a pair is dropped if either
+# mate aligns. Paired survivors go to separate R1/R2 files with -O, else
+# interleaved (<id>/1, <id>/2) into -o.
+#
+# Runs on Linux and macOS (bash 3.2 or later).
+#
+# Requires a rype build with `classify filter`: until it is merged into
+# https://github.com/the-miint/rype, build branch michaeliter/classify-filter
+# of https://github.com/michaeliter/RYpe.
+#
+# Tools are found on PATH, or via RYPE_BIN / MINIMAP2_BIN / SAMTOOLS_BIN /
+# BGZIP_BIN.
+
+set -euo pipefail
+
+VERSION=0.1.0
+
+usage () {
+    cat >&2 <<'EOF'
+usage: rype-hf -i HOST.ryxdi -1 R1.fq[.gz] [-2 R2.fq[.gz]] -t THRESHOLD -o OUT [-O OUT2]
+               [-m HOST.mmi [-x PRESET]] [-p THREADS] [-M MAX_MEMORY] [-s STATS.tsv]
+
+  -i  rype host index (.ryxdi)
+  -1  reads (FASTA/FASTQ, optionally gzipped); -2 mates for paired input
+  -t  rype score threshold: a read/pair scoring >= this in any bucket is host
+  -o  output: '-' for stdout, *.gz for bgzip -l1 (BGZF, multi-threaded), else plain FASTQ.
+      Paired survivors are interleaved here unless -O is given.
+  -O  paired input only: write R2 mates here and R1 mates to -o (both files, same
+      rules for *.gz)
+  -m  minimap2 host index for the rescue pass (omit for rype only)
+  -x  minimap2 preset for the rescue pass (default: sr)
+  -p  threads (default: $SLURM_CPUS_PER_TASK, else all CPUs)
+  -M  rype --max-memory, e.g. 48G (default: auto -- 90% of the job's memory
+      limit minus 512 MiB, after minimap2's footprint (1.25 x the .mmi size
+      + 1 GiB) with -m)
+  -s  write a one-row TSV of read counts per stage
+  -V  print the version and exit
+EOF
+    exit 2
+}
+
+INDEX= R1= R2= THRESHOLD= OUT= OUT2= MMI= PRESET=sr THREADS= MAXMEM=auto STATS=
+while getopts ":i:1:2:t:o:O:m:x:p:M:s:Vh" opt; do
+    case ${opt} in
+        i) INDEX=${OPTARG} ;;   1) R1=${OPTARG} ;;      2) R2=${OPTARG} ;;
+        t) THRESHOLD=${OPTARG} ;; o) OUT=${OPTARG} ;;   O) OUT2=${OPTARG} ;;
+        m) MMI=${OPTARG} ;;     x) PRESET=${OPTARG} ;;  p) THREADS=${OPTARG} ;;
+        M) MAXMEM=${OPTARG} ;;  s) STATS=${OPTARG} ;;   V) echo "rype-hf ${VERSION}"; exit 0 ;;
+        *) usage ;;
+    esac
+done
+[[ -n ${INDEX} && -n ${R1} && -n ${THRESHOLD} && -n ${OUT} ]] || usage
+if [[ -n ${OUT2} ]]; then
+    [[ -n ${R2} ]] || { echo "rype-hf: -O needs paired input (-2)" >&2; exit 2; }
+    [[ ${OUT} != - && ${OUT2} != - ]] || { echo "rype-hf: with -O, -o and -O must be files" >&2; exit 2; }
+fi
+ncpu () { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1; }
+THREADS=${THREADS:-${SLURM_CPUS_PER_TASK:-$(ncpu)}}
+
+RYPE_BIN=${RYPE_BIN:-$(command -v rype || true)}
+[[ -x ${RYPE_BIN} ]] || { echo "rype-hf: rype not found (set RYPE_BIN)" >&2; exit 1; }
+"${RYPE_BIN}" classify filter --help >/dev/null 2>&1 \
+    || { echo "rype-hf: ${RYPE_BIN} has no 'classify filter' subcommand" >&2; exit 1; }
+if [[ -n ${MMI} ]]; then
+    MINIMAP2_BIN=${MINIMAP2_BIN:-$(command -v minimap2 || true)}
+    SAMTOOLS_BIN=${SAMTOOLS_BIN:-$(command -v samtools || true)}
+    [[ -x ${MINIMAP2_BIN} && -x ${SAMTOOLS_BIN} ]] \
+        || { echo "rype-hf: -m needs minimap2 and samtools (set MINIMAP2_BIN/SAMTOOLS_BIN)" >&2; exit 1; }
+fi
+if [[ ${OUT} == *.gz || ${OUT2} == *.gz ]]; then
+    BGZIP_BIN=${BGZIP_BIN:-$(command -v bgzip || true)}
+    [[ -x ${BGZIP_BIN} ]] || { echo "rype-hf: *.gz output needs bgzip (set BGZIP_BIN)" >&2; exit 1; }
+fi
+
+# Memory limit in bytes for this process: the tightest cgroup v2 memory.max
+# from our cgroup up to the root (Slurm puts the limit on the job/user level,
+# the task's own cgroup says "max"), else Slurm's per-node allocation, else
+# MemAvailable (Linux), else total RAM (macOS: hw.memsize, as rype's own auto).
+memory_limit () {
+    local lim= v d
+    d=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)
+    while [[ -n ${d} ]]; do
+        v=$(cat "/sys/fs/cgroup${d}/memory.max" 2>/dev/null || true)
+        if [[ ${v} =~ ^[0-9]+$ ]] && [[ -z ${lim} || ${v} -lt ${lim} ]]; then
+            lim=${v}
+        fi
+        [[ ${d} == / ]] && break
+        d=$(dirname "${d}")
+    done
+    if [[ -z ${lim} && -n ${SLURM_MEM_PER_NODE:-} ]]; then
+        lim=$(( SLURM_MEM_PER_NODE * 1024 * 1024 ))
+    fi
+    if [[ -z ${lim} && -r /proc/meminfo ]]; then
+        lim=$(awk '/^MemAvailable:/ {print $2 * 1024}' /proc/meminfo)
+    fi
+    [[ -n ${lim} ]] || lim=$(sysctl -n hw.memsize 2>/dev/null || true)
+    if [[ ! ${lim} =~ ^[0-9]+$ ]]; then
+        echo "rype-hf: cannot detect a memory limit; set -M" >&2
+        return 1
+    fi
+    echo "${lim}"
+}
+
+# rype's --max-memory. rype's own "auto" only reads its task cgroup, which
+# misses the limit under Slurm, and it cannot know minimap2 shares the
+# allocation. minimap2 holds its whole index for the run: 11.2 GB peak
+# measured for an 8.9 GB -x sr .mmi, hence 1.25 x the file plus 1 GiB of
+# mapping buffers. rype gets 90% of the rest minus 512 MiB: long reads run
+# past rype's budget (+0.18 GiB at --max-memory 12G, +0.68 GiB at 7.2G with 44
+# passes), and the cgroup also charges kernel memory and page cache, so a
+# budget equal to the limit OOMs. Small budgets are allowed down to 256 MiB
+# (rype's own minimum safety margin): rype has no hard floor, it runs more
+# classification passes and may overshoot small budgets.
+if [[ ${MAXMEM} == auto ]]; then
+    LIMIT=$(memory_limit)
+    RESERVE=0
+    if [[ -n ${MMI} ]]; then
+        RESERVE=$(( $(wc -c < "${MMI}") * 5 / 4 + (1 << 30) ))
+    fi
+    MAXMEM=$(( (LIMIT - RESERVE) / 10 * 9 - (512 << 20) ))
+    if (( MAXMEM < 256 << 20 )); then
+        echo "rype-hf: only $(( MAXMEM >> 20 )) MiB left for rype (limit $(( LIMIT >> 20 )) MiB," \
+             "minimap2 reserve $(( RESERVE >> 20 )) MiB); give the job more memory or set -M" >&2
+        exit 1
+    fi
+    echo "rype-hf: memory limit $(( LIMIT >> 20 )) MiB, minimap2 reserve $(( RESERVE >> 20 )) MiB," \
+         "rype --max-memory $(( MAXMEM >> 20 )) MiB" >&2
+fi
+
+# Per-stage stderr goes to small log files so read counts can be reported.
+LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/rype-hf.XXXXXX")
+trap 'rm -rf "${LOGDIR}"' EXIT
+
+# Extra arguments go to rype (--output/--output2) or samtools fastq (-1/-2...).
+rype_stage () {
+    RAYON_NUM_THREADS=${THREADS} "${RYPE_BIN}" classify filter -i "${INDEX}" \
+        -1 "${R1}" ${R2:+-2 "${R2}"} -t "${THRESHOLD}" --max-memory "${MAXMEM}" "$@" \
+        2> "${LOGDIR}/rype.err"
+}
+
+rescue_stage () {
+    if [[ -z ${MMI} ]]; then
+        cat
+        return
+    fi
+    # -f 12: read AND mate unmapped (pairs); -f 4 for single-end. Unmapped
+    # records are never secondary/supplementary, -F 0x900 is belt and braces.
+    local keep_flags=4
+    [[ -n ${R2} ]] && keep_flags=12
+    "${MINIMAP2_BIN}" -a -x "${PRESET}" --secondary=no -t "${THREADS}" -2 "${MMI}" - \
+        2> "${LOGDIR}/minimap2.err" \
+        | "${SAMTOOLS_BIN}" fastq -f "${keep_flags}" -F 0x900 "$@" - 2> "${LOGDIR}/samtools.err"
+}
+
+# stdin -> $1 with $2 compression threads: '-' stdout; *.gz bgzip -l1 (when
+# most reads survive, gzip's default level 6 costs several times the
+# classification time); else plain.
+sink () {
+    case $1 in
+        -)    cat ;;
+        *.gz) "${BGZIP_BIN}" -@ "$2" -l 1 -c > "$1" ;;
+        *)    cat > "$1" ;;
+    esac
+}
+
+pipeline () {
+    if [[ -z ${OUT2} ]]; then
+        rype_stage | rescue_stage | sink "${OUT}" "${THREADS}"
+        return
+    fi
+    # Split R1/R2: one bgzip per mate, each with half the threads, so
+    # compression gets the same total as one interleaved stream. rype and samtools cannot start compressors
+    # themselves, so each mate reaches its bgzip through a FIFO: rype writes R1
+    # to --output and R2 to --output2; after the rescue pass, samtools fastq
+    # splits by the READ1/READ2 flags. Anything samtools could not place (-0:
+    # neither flag, -s: mate missing) is caught below.
+    local r1=${LOGDIR}/r1.fifo r2=${LOGDIR}/r2.fifo s=0 s1=0 s2=0 p1 p2
+    local half=$(( THREADS / 2 > 0 ? THREADS / 2 : 1 ))
+    mkfifo "${r1}" "${r2}"
+    sink "${OUT}" "${half}" < "${r1}" & p1=$!
+    sink "${OUT2}" "${half}" < "${r2}" & p2=$!
+    # Hold both FIFOs open for writing until the pipeline is done, so neither
+    # sink can wait forever on a stage that failed before opening its output.
+    exec 7> "${r1}" 8> "${r2}"
+    if [[ -n ${MMI} ]]; then
+        # -N keeps the /1 /2 suffixes rype writes, which samtools drops by
+        # default when writing mates to separate files.
+        { rype_stage | rescue_stage -N -1 "${r1}" -2 "${r2}" \
+            -0 "${LOGDIR}/unpaired.fq" -s "${LOGDIR}/singletons.fq"; } 7>&- 8>&- || s=$?
+    else
+        rype_stage --output "${r1}" --output2 "${r2}" 7>&- 8>&- || s=$?
+    fi
+    exec 7>&- 8>&-
+    wait "${p1}" || s1=$?
+    wait "${p2}" || s2=$?
+    if [[ -s ${LOGDIR}/unpaired.fq || -s ${LOGDIR}/singletons.fq ]]; then
+        echo "rype-hf: samtools fastq could not pair some records:" \
+             "$(wc -l < "${LOGDIR}/unpaired.fq" 2>/dev/null || echo 0) unpaired lines," \
+             "$(wc -l < "${LOGDIR}/singletons.fq" 2>/dev/null || echo 0) singleton lines" >&2
+        (( s )) || s=1
+    fi
+    (( s )) || s=${s1}
+    (( s )) || s=${s2}
+    return "${s}"
+}
+
+pipeline || {
+    status=$?
+    cat "${LOGDIR}"/*.err >&2
+    echo "rype-hf: pipeline failed (exit ${status})" >&2
+    exit "${status}"
+}
+cat "${LOGDIR}/rype.err" >&2
+
+# reads_in/rype_kept count reads, or pairs for paired input; final_kept counts
+# FASTQ records (two per pair), as reported by samtools.
+count () { grep -o "$1=[0-9]*" "${LOGDIR}/rype.err" | tail -1 | cut -d= -f2; }
+reads_in=$(count reads_in); rype_kept=$(count written)
+final_records=NA
+if [[ -n ${MMI} ]]; then
+    final_records=$(grep -o 'processed [0-9]* reads' "${LOGDIR}/samtools.err" | grep -o '[0-9]*' || echo NA)
+    grep -E 'Real time|Peak RSS' "${LOGDIR}/minimap2.err" >&2 || true
+fi
+echo "rype-hf: reads_in=${reads_in} rype_kept=${rype_kept} rescue_kept_records=${final_records}" >&2
+if [[ -n ${STATS} ]]; then
+    printf "reads_in\trype_kept\trescue_kept_records\n%s\t%s\t%s\n" \
+        "${reads_in}" "${rype_kept}" "${final_records}" > "${STATS}"
+fi
