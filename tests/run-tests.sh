@@ -43,7 +43,7 @@ deinterleave () {  # <interleaved> <1|2>
         | if [[ $2 == 1 ]]; then cut -f1-4; else cut -f5-8; fi | tr '\t' '\n'
 }
 suffixes_kept () { ! names "$1" | grep -qv '/1$' && ! names "$2" | grep -qv '/2$'; }
-same_content () { cmp -s <(case $1 in *.gz) gzip -dc "$1" ;; *) cat "$1" ;; esac) "$2"; }
+same_content () { cmp -s <(case $1 in (*.gz) gzip -dc "$1" ;; (*) cat "$1" ;; esac) "$2"; }
 
 # --- test data: a 50 kb "host" genome, 100 pairs drawn from it and 100 random
 # pairs (named host::pN and microbe::pN), plus a single-end set.
