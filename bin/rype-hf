@@ -14,9 +14,7 @@
 #
 # Runs on Linux and macOS (bash 3.2 or later).
 #
-# Requires a rype build with `classify filter`: until it is merged into
-# https://github.com/the-miint/rype, build branch michaeliter/classify-filter
-# of https://github.com/michaeliter/RYpe.
+# Requires rype 1.0.0 or later (`classify filter`): cargo install rype
 #
 # Tools are found on PATH, or via RYPE_BIN / MINIMAP2_BIN / SAMTOOLS_BIN /
 # BGZIP_BIN.

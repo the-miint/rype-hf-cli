@@ -13,7 +13,7 @@ rype classify filter  ->  [minimap2 -a | samtools fastq (unmapped only)]  ->  bg
 
 | Tool | Needed for | Install from |
 |---|---|---|
-| [rype](https://github.com/the-miint/rype) with `classify filter` | always | source (Rust), step 2 |
+| [rype](https://github.com/the-miint/rype) 1.0.0 or later | always | crates.io (`cargo install`), step 2 |
 | `bgzip` (htslib) | `*.gz` output | conda, Homebrew or apt, step 3 |
 | `minimap2` and `samtools` | the rescue pass (`-m`) | conda, Homebrew or apt, step 3 |
 
@@ -42,18 +42,17 @@ Some of rype's dependencies compile C code, so you also need a C compiler:
 
 ### 2. Install rype
 
-`classify filter` is in rype's `main` branch but not yet in a crates.io
-release: `cargo install rype` installs 1.0.0-rc.1, which predates it. Install
-from GitHub instead:
+`rype-hf` needs rype 1.0.0 or later, the first crates.io release with
+`classify filter`.
 
 ```bash
-cargo install --git https://github.com/the-miint/rype rype --bin rype --force
+cargo install rype --bin rype --force
 ```
 
 This builds a release binary and installs it as `~/.cargo/bin/rype`. The build
 takes a few minutes. `--force` replaces an older rype if you have one.
 
-To pin a commit for reproducibility, add `--rev <commit>`.
+To pin a version for reproducibility, add `--version 1.0.0`.
 
 ### 3. Install bgzip, minimap2 and samtools
 
@@ -221,7 +220,7 @@ RYPE_BIN=/path/to/rype/target/release/rype rype-hf -i human.ryxdi ...
 | Error | Fix |
 |---|---|
 | `rype not found (set RYPE_BIN)` | Add `~/.cargo/bin` to `PATH` (`source "$HOME/.cargo/env"`), or set `RYPE_BIN`. |
-| `... has no 'classify filter' subcommand` | Your rype is older than `classify filter`. Reinstall it (step 2), and check `which rype` is the new one. |
+| `... has no 'classify filter' subcommand` | Your rype is older than 1.0.0. Reinstall it (step 2), and check `which rype` is the new one. |
 | `*.gz output needs bgzip` | Install htslib (step 3), or activate your conda environment. |
 | `-m needs minimap2 and samtools` | Install them (step 3), or activate your conda environment. |
 | `cannot detect a memory limit; set -M` | Pass rype's memory budget yourself, e.g. `-M 32G`. |
